@@ -1,95 +1,99 @@
-import csv
 import time
+from collections import defaultdict
 from datetime import datetime
 
 import pandas as pd
 from scapy.all import sniff
 from scapy.layers.dns import DNS
-from scapy.layers.http import HTTPRequest
 from scapy.layers.inet import IP, TCP, UDP
 from sklearn.ensemble import IsolationForest
+from tabulate import tabulate
 
 LOCAL_IP = "192.168.0.113"
-LOG_FILE = "advanced_ids_logs.csv"
 
 packets_data = []
+alerts = []
 
-with open(LOG_FILE, mode='w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow([
-        "timestamp", "direction", "src_ip", "src_port",
-        "dst_ip", "dst_port", "protocol",
-        "length", "tcp_flags", "dns_query",
-        "http_host", "alert_type"
-    ])
+port_tracker = defaultdict(set)
+syn_tracker = defaultdict(int)
+beacon_tracker = defaultdict(list)
 
-def log_packet(data):
-    with open(LOG_FILE, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(data)
+SUSPICIOUS_PORTS = [4444, 1337, 5555]
+
+def classify_threat(packet, src_ip, dst_ip):
+    threat = "NORMAL"
+
+    if packet.haslayer(TCP):
+        dport = packet[TCP].dport
+        flags = packet[TCP].flags
+
+        # Red Team - SYN Scan
+        if flags == "S":
+            syn_tracker[src_ip] += 1
+            if syn_tracker[src_ip] > 20:
+                threat = "SYN SCAN"
+
+        # Malware Reverse Shell
+        if dport in SUSPICIOUS_PORTS:
+            threat = "REVERSE SHELL"
+
+        # Port Scan
+        port_tracker[src_ip].add(dport)
+        if len(port_tracker[src_ip]) > 15:
+            threat = "PORT SCAN"
+
+    # Beaconing detection
+    now = time.time()
+    beacon_tracker[src_ip].append(now)
+    beacon_tracker[src_ip] = [t for t in beacon_tracker[src_ip] if now - t < 10]
+
+    if len(beacon_tracker[src_ip]) > 30:
+        threat = "POSSIBLE BEACONING"
+
+    return threat
 
 def process_packet(packet):
-
     if not packet.haslayer(IP):
         return
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    src_ip = packet[IP].src
-    dst_ip = packet[IP].dst
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    src = packet[IP].src
+    dst = packet[IP].dst
     length = len(packet)
+    protocol = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "OTHER"
 
-    direction = "OUTBOUND" if src_ip == LOCAL_IP else "INBOUND"
+    threat = classify_threat(packet, src, dst)
 
-    protocol = "OTHER"
-    src_port = "-"
-    dst_port = "-"
-    tcp_flags = "-"
-    dns_query = "-"
-    http_host = "-"
-    alert_type = "NORMAL"
+    packet_info = {
+        "Time": timestamp,
+        "From": src,
+        "To": dst,
+        "Protocol": protocol,
+        "Length": length,
+        "Threat": threat
+    }
 
-    if packet.haslayer(TCP):
-        protocol = "TCP"
-        src_port = packet[TCP].sport
-        dst_port = packet[TCP].dport
-        tcp_flags = packet[TCP].flags
+    packets_data.append(packet_info)
 
-    elif packet.haslayer(UDP):
-        protocol = "UDP"
-        src_port = packet[UDP].sport
-        dst_port = packet[UDP].dport
+def run_ml_detection():
+    df = pd.DataFrame(packets_data)
 
-    if packet.haslayer(DNS):
-        dns_query = packet[DNS].qd.qname.decode()
-
-    if packet.haslayer(HTTPRequest):
-        http_host = packet[HTTPRequest].Host.decode()
-
-    packets_data.append({"length": length})
-
-    log_packet([
-        timestamp, direction, src_ip, src_port,
-        dst_ip, dst_port, protocol,
-        length, tcp_flags, dns_query,
-        http_host, alert_type
-    ])
-
-def detect_ml_anomalies():
-    if len(packets_data) < 20:
-        print("Not enough data for ML detection...")
+    if len(df) < 20:
         return
 
-    df = pd.DataFrame(packets_data)
     model = IsolationForest(contamination=0.05)
-    df["anomaly"] = model.fit_predict(df[["length"]])
+    df["ML_Anomaly"] = model.fit_predict(df[["Length"]])
 
-    anomalies = df[df["anomaly"] == -1]
+    df.loc[df["ML_Anomaly"] == -1, "Threat"] = "ML_ANOMALY"
 
-    for index in anomalies.index:
-        print("🚨 ML Anomaly Detected at packet index:", index)
+    return df
 
-print("🚀 Advanced SOC-Level IDS Started...")
+print(" Elite SOC IDS Running...")
 sniff(prn=process_packet, count=200, iface="en0", filter="ip")
-detect_ml_anomalies()
 
-print("✅ Logs saved to advanced_ids_logs.csv")
+df = run_ml_detection()
+
+if df is not None:
+    print(tabulate(df.tail(20), headers="keys", tablefmt="fancy_grid"))
+
+print("\n Detection Completed")
